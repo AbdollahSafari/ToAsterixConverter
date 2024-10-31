@@ -24,12 +24,12 @@ public class HDLCAnalyzer
     public event EventHandler<byte[]> DataFrameExtracted;
     private bool _isPortOpened;
     private bool _connecting = false;
-    private SerialPortConfig _config = JsonFileBasedConfiguration.Read<SerialPortConfig>();
-    private Crc16Ccitt _crc16Ccitt = new Crc16Ccitt(Crc16Ccitt.InitialCrcValue.Zeros);
-    private byte[] _crc = new byte[2];
+    private readonly SerialPortConfig _config = JsonFileBasedConfiguration.Read<SerialPortConfig>();
+    private readonly Crc16Ccitt _crc16Ccitt = new(Crc16Ccitt.InitialCrcValue.Zeros);
+    private readonly byte[] _crc = new byte[2];
     private byte[] _dataBytesToSend;
-    private List<byte> _dataBytes = new();
-    private ReadingState _readingState = ReadingState.WaitToStart;
+    private readonly List<byte> _dataBytes = new();
+    private ReadingState _readingState = ReadingState.StopReading;
 
     public (bool isSuccess, string? errorMessage) OpenPort()
     {
@@ -72,87 +72,86 @@ public class HDLCAnalyzer
         {
             for (var i = 0; i < readLength; i++)
             {
-                var data = (byte) (255 - buffer[i]);
+                var data = (byte)(255 - buffer[i]);
                 if (_readingState is ReadingState.StopReading)
                 {
                     if (data is 0x7E)
                     {
-                        _readingState = ReadingState.WaitToStart;
+                        _readingState = ReadingState.Control;
                         continue;
                     }
                 }
 
-                if (_readingState is ReadingState.WaitToStart && data is not 0x7E)
+                if (_readingState == ReadingState.Control)
                 {
-                    _readingState = ReadingState.Reading;
+                    if (data is not 0x7E)
+                    {
+                        _readingState = ReadingState.Address;
+                        continue;
+                    }
+                    ResetState();
+                    continue;
                 }
-
-                if (_readingState is ReadingState.Reading)
+                if (_readingState == ReadingState.Address)
+                {
+                    if (data is not 0x7E)
+                    {
+                        _readingState = ReadingState.Data;
+                        _dataBytes.Add(data);
+                        continue;
+                    }
+                    ResetState();
+                    continue;
+                }
+                if (_readingState is ReadingState.Data)
                 {
 
-                    if (data != 0x7E)
+                    if (data is not 0x7E)
                     {
                         _dataBytes.Add(data);
+                        continue;
                     }
-                    else
+                    _readingState = ReadingState.Is7EInData;
+                    continue;
+                }
+
+                if (_readingState == ReadingState.Is7EInData)
+                {
+                    if (data is not 0x7E)
                     {
-                        if (_dataBytes.Count > 10)
-                        {
-                            _crc[1] = _dataBytes[^1];
-                            _crc[0] = _dataBytes[^2];
-                            _readingState = ReadingState.CrcCheck;
-                        }
-                        else
-                        {
-                            _readingState = ReadingState.WaitToStart;
-                        }
+                        _dataBytes.Add(0x7E);
+                        _dataBytes.Add(data);
+                        _readingState = ReadingState.Data;
+                        continue;
                     }
+
+                    _readingState = ReadingState.CrcCheck;
                 }
                 if (_readingState is ReadingState.CrcCheck)
                 {
+                    _crc[1] = _dataBytes[^1];
+                    _crc[0] = _dataBytes[^2];
+                    _dataBytes.RemoveAt(_dataBytes.Last());
+                    _dataBytes.RemoveAt(_dataBytes.Last());
+
                     var dataArray = _dataBytes.ToArray();
                     var calculatedCrc = _crc16Ccitt.ComputeChecksumBytes(dataArray, false);
                     if (calculatedCrc.Length == _crc.Length && calculatedCrc[0] == _crc[0] && calculatedCrc[1] == _crc[1])
                     {
-                        ////Remove 2 first bytes (Address & Control)
-                        //_dataBytes.Remove(_dataBytes[1]);
-                        //_dataBytes.Remove(_dataBytes[0]);
-                        ////Send data on socket
-                        //OnDataFrameExtracted(_dataBytes.ToArray());
+                        //Send data on socket
+                        OnDataFrameExtracted(dataArray);
+                        ResetState();
                     }
-                    //Remove 2 first bytes (Address & Control)
-                    _dataBytes.RemoveAt(0);
-                    _dataBytes.RemoveAt(0);
-                    //Send data on socket
-                    OnDataFrameExtracted(_dataBytes.ToArray());
-                    _dataBytes.Clear();
-                    _readingState = ReadingState.StopReading;
                 }
-
-                //if (_readingState is ReadingState.Reading)
-                //{
-                //    if (i + 2 <= readLength)
-                //    {
-                //        if (buffer[i + 2] != 0x7E)
-                //        {
-                //            dataBytes.Add(buffer[i]);
-                //        }
-                //        else if (buffer[i + 2] == 0x7E)
-                //        {
-                //            crc[0] = buffer[i + 1];
-                //            crc[1] = buffer[i + 2];
-                //            i += 2;
-                //        }
-                //    }
-                //    else
-                //    {
-                //        _readingState = ReadingState.StopReading;
-                //    }
-                //}
             }
         }
     }
 
+    private void ResetState()
+    {
+        _dataBytes.Clear();
+        _readingState = ReadingState.StopReading;
+    }
     public async Task AnalyzeHDLCPacketAsync()
     {
 
@@ -167,7 +166,10 @@ public class HDLCAnalyzer
 public enum ReadingState
 {
     WaitToStart,
-    Reading,
+    Control,
+    Address,
+    Data,
+    Is7EInData,
     StopReading,
     CrcCheck,
 }
